@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import re
+import json
+from pathlib import Path
 
 st.set_page_config(page_title="会計DXアプリ", layout="centered")
 st.title("会計DXアプリ")
@@ -59,6 +61,60 @@ def detect_subject_candidates(df: pd.DataFrame):
         scores[col] = kw_hits * 3 + jp_hits * 1 + len_ok * 0.2
     # スコア順
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+# =========================
+# ③ カテゴリ分類ルール（JSON）
+# =========================
+RULES_PATH = Path("category_rules.json")
+
+DEFAULT_CATEGORIES = [
+    "売上",
+    "原価",
+    "給与",
+    "役員報酬",
+    "外注費",
+    "消耗品費",
+    "交際費",
+    "会議費",
+    "水道光熱費",
+    "保険料",
+    "水道光熱費",
+    "修繕費",
+    "賃借料",
+    "リース料",
+    "福利厚生費",
+    "法定福利費",
+    "地代家賃",
+    "通信費",
+    "車両費",
+    "賃借料",
+    "旅費交通費",
+    "広告宣伝費",
+    "支払手数料",
+    "減価償却",
+    "租税公課",
+    "その他販管費",
+    "営業外収益",
+    "営業外費用",
+    "特別利益",
+    "特別損失",
+    "法人税等",
+    "未分類"
+]
+
+def load_rules() -> dict:
+    if RULES_PATH.exists():
+        try:
+            return json.loads(RULES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_rules(rules: dict) -> None:
+    RULES_PATH.write_text(
+        json.dumps(rules, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
 def detect_amount_candidates(df: pd.DataFrame):
     """金額列っぽい列をスコアリングして候補を返す"""
@@ -123,7 +179,7 @@ if uploaded_file is not None:
         })
 
         # 科目が空の行や金額が全部NaNの行を落とす
-                # ===== 正規化（科目＋金額）=====
+        # ===== 正規化（科目＋金額）=====
         subject_series = df_raw[subject_col]
         amount_series = df_raw[amount_col]
 
@@ -142,11 +198,14 @@ if uploaded_file is not None:
         # 金額がない行を除外
         df_norm = df_norm[df_norm["金額"].notna()]
 
+        # 金額列を「数値型」に確定（groupby集計で落ちないように）
+        df_norm["金額"] = pd.to_numeric(df_norm["金額"], errors="coerce")
+        df_norm = df_norm[df_norm["金額"].notna()]
 
         st.write("### 正規化プレビュー（科目＋金額）")
         st.dataframe(df_norm.head(20))
 
-                # =========================
+        # =========================
         # ② 利益系（再計算）サマリー
         # =========================
         st.write("### ② 利益サマリー（再計算）")
@@ -161,14 +220,13 @@ if uploaded_file is not None:
         sales = sum_by_keywords(df_norm, ["売上高"])
         cogs = sum_by_keywords(df_norm, ["売上原価"])
         sga = sum_by_keywords(df_norm, [
-    "販売管理計", "販売管理費計", "販売管理費 計",
-    "販管費計", "販管費 計",
-    "販売費及び一般管理費計", "販売費及び一般管理費 計"
-])
-
+            "販売管理計", "販売管理費計", "販売管理費 計",
+            "販管費計", "販管費 計",
+            "販売費及び一般管理費計", "販売費及び一般管理費 計"
+        ])
 
         nonop_income = sum_by_keywords(df_norm, ["営業外収益"])
-        nonop_exp    = sum_by_keywords(df_norm, ["営業外費用"])
+        nonop_exp = sum_by_keywords(df_norm, ["営業外費用"])
 
         special_gain = sum_by_keywords(df_norm, ["特別利益", "特別収益"])
         special_loss = sum_by_keywords(df_norm, ["特別損失"])
@@ -202,6 +260,78 @@ if uploaded_file is not None:
             st.metric("税引前利益", yen(pretax_profit))
             st.metric("税引後利益（参考）", yen(net_profit))
 
+        # =========================
+        # ③ 半自動：勘定科目カテゴリ分類
+        # =========================
+        st.write("### ③ 勘定科目のカテゴリ分類（半自動）")
+
+        rules = load_rules()
+
+        # 科目一覧（重複除去）
+        subjects = sorted(df_norm["科目"].astype(str).unique())
+
+        # 既存ルールでカテゴリ付与
+        def assign_category(subj: str) -> str:
+            return rules.get(subj, "未分類")
+
+        df_cat = df_norm.copy()
+        df_cat["カテゴリ"] = df_cat["科目"].astype(str).apply(assign_category)
+
+        # 未分類だけをまず見せる
+        unclassified_subjects = sorted(
+            df_cat[df_cat["カテゴリ"] == "未分類"]["科目"].astype(str).unique().tolist()
+        )
+        st.write(f"未分類の科目数: {len(unclassified_subjects)}")
+
+        MAX_ROWS = 50
+        target_subjects = unclassified_subjects[:MAX_ROWS]
+
+        if len(target_subjects) == 0:
+            st.success("未分類の科目はありません。")
+        else:
+            st.info("未分類科目にカテゴリを割り当ててください（最大50件まで表示）。保存すると次回から自動分類されます。")
+
+            updates = {}
+            for subj in target_subjects:
+                current = rules.get(subj, "未分類")
+                updates[subj] = st.selectbox(
+                    f"科目: {subj}",
+                    options=DEFAULT_CATEGORIES,
+                    index=DEFAULT_CATEGORIES.index(current) if current in DEFAULT_CATEGORIES else DEFAULT_CATEGORIES.index("未分類")
+                )
+
+            col_save, col_reload = st.columns(2)
+
+            with col_save:
+                if st.button("分類ルールを保存"):
+                    for k, v in updates.items():
+                        if v != "未分類":
+                            rules[k] = v
+                    save_rules(rules)
+                    st.success("保存しました。次回から自動分類されます。")
+
+            with col_reload:
+                if st.button("ルールを読み直す"):
+                    st.rerun()
+
+        # カテゴリ別集計
+        st.write("### カテゴリ別集計")
+        df_cat["カテゴリ"] = df_cat["科目"].astype(str).apply(lambda s: rules.get(s, "未分類"))
+
+        # 念のため df_cat 側でも数値化した列で集計
+        df_cat["金額_num"] = pd.to_numeric(df_cat["金額"], errors="coerce")
+
+        summary = (
+            df_cat.groupby("カテゴリ", dropna=False)["金額_num"]
+            .sum(min_count=1)
+            .sort_values(ascending=False)
+            .reset_index()
+            .rename(columns={"金額_num": "金額"})
+        )
+
+        summary["金額"] = summary["金額"].round(0).astype("Int64")
+
+        st.dataframe(summary, use_container_width=True)
 
         st.info("次はこの正規化データを使って『小計・合計の除外』や『売上/費用/利益の簡易集計』に進めます。")
 
