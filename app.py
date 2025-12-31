@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 import re
-import json
-from pathlib import Path
 
 st.set_page_config(page_title="会計DXアプリ", layout="centered")
 st.title("会計DXアプリ")
@@ -13,29 +11,28 @@ uploaded_file = st.file_uploader(
     type=["csv"]
 )
 
+# =========================
+# 基本ユーティリティ
+# =========================
 def is_number_like(x: str) -> bool:
-    """'1,234' や '(1,234)' や '▲1,234' などの会計っぽい表記を数値候補として扱う"""
     if x is None:
         return False
     s = str(x).strip()
     if s == "" or s.lower() == "nan":
         return False
-    s = s.replace(",", "")
-    s = s.replace("▲", "-")
-    # (123) 形式も負数扱いにする
+    s = s.replace(",", "").replace("▲", "-")
     if re.fullmatch(r"\(\s*-?\d+(\.\d+)?\s*\)", s):
         return True
     return re.fullmatch(r"-?\d+(\.\d+)?", s) is not None
 
+
 def to_number(x: str):
-    """会計っぽい表記を数値に寄せる（変換できなければNaN）"""
     if x is None:
         return pd.NA
     s = str(x).strip()
     if s == "" or s.lower() == "nan":
         return pd.NA
     s = s.replace(",", "").replace("▲", "-")
-    # (123) -> -123
     if re.fullmatch(r"\(\s*-?\d+(\.\d+)?\s*\)", s):
         s = s.strip()[1:-1].strip()
         if s.startswith("-"):
@@ -46,78 +43,20 @@ def to_number(x: str):
     except Exception:
         return pd.NA
 
+
 def detect_subject_candidates(df: pd.DataFrame):
-    """科目列っぽい列をスコアリングして候補を返す"""
     keywords = ["売上", "原価", "利益", "費用", "経費", "収益", "販管", "人件", "外注", "租税", "減価"]
     scores = {}
     for col in df.columns:
         s = df[col].astype(str)
-        # キーワードが含まれる行数
         kw_hits = s.str.contains("|".join(keywords), regex=True).sum()
-        # 日本語（ひら/カタ/漢字）が含まれる行数（ざっくり）
         jp_hits = s.str.contains(r"[ぁ-んァ-ン一-龥]").sum()
-        # 文字列長がそこそこある行（科目は短〜中くらいが多い）
         len_ok = s.str.len().fillna(0).between(1, 40).sum()
         scores[col] = kw_hits * 3 + jp_hits * 1 + len_ok * 0.2
-    # スコア順
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
-# =========================
-# ③ カテゴリ分類ルール（JSON）
-# =========================
-RULES_PATH = Path("category_rules.json")
-
-DEFAULT_CATEGORIES = [
-    "売上",
-    "原価",
-    "給与",
-    "役員報酬",
-    "外注費",
-    "消耗品費",
-    "交際費",
-    "会議費",
-    "水道光熱費",
-    "保険料",
-    "水道光熱費",
-    "修繕費",
-    "賃借料",
-    "リース料",
-    "福利厚生費",
-    "法定福利費",
-    "地代家賃",
-    "通信費",
-    "車両費",
-    "賃借料",
-    "旅費交通費",
-    "広告宣伝費",
-    "支払手数料",
-    "減価償却",
-    "租税公課",
-    "その他販管費",
-    "営業外収益",
-    "営業外費用",
-    "特別利益",
-    "特別損失",
-    "法人税等",
-    "未分類"
-]
-
-def load_rules() -> dict:
-    if RULES_PATH.exists():
-        try:
-            return json.loads(RULES_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-def save_rules(rules: dict) -> None:
-    RULES_PATH.write_text(
-        json.dumps(rules, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
 
 def detect_amount_candidates(df: pd.DataFrame):
-    """金額列っぽい列をスコアリングして候補を返す"""
     scores = {}
     for col in df.columns:
         s = df[col].astype(str)
@@ -126,9 +65,22 @@ def detect_amount_candidates(df: pd.DataFrame):
         scores[col] = num_like * 2 + non_empty * 0.1
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
+
+def sum_by_keywords(df: pd.DataFrame, keywords: list[str]) -> float:
+    mask = df["科目"].astype(str).apply(lambda x: any(k in x for k in keywords))
+    s = df.loc[mask, "金額"].sum()
+    return float(s) if pd.notna(s) else 0.0
+
+
+def yen(x: float) -> str:
+    return f"{int(round(float(x))):,}"
+
+
+# =========================
+# メイン
+# =========================
 if uploaded_file is not None:
     try:
-        # 壊れにくい読み込み（今回の会計CSV向け）
         df_raw = pd.read_csv(
             uploaded_file,
             encoding="cp932",
@@ -139,23 +91,17 @@ if uploaded_file is not None:
         )
 
         st.success("CSVの読み込みに成功しました。")
-
-        # ほぼ空の行を落とす（全列が空/NaNの行）
         df_raw = df_raw.dropna(how="all").reset_index(drop=True)
 
         st.write("### ① 列の意味づけ（推定 → 選択）")
 
-        # 候補検出
         subject_candidates = detect_subject_candidates(df_raw)
         amount_candidates = detect_amount_candidates(df_raw)
 
-        # 推定トップ
         suggested_subject = subject_candidates[0][0] if subject_candidates else df_raw.columns[0]
         suggested_amount = amount_candidates[0][0] if amount_candidates else df_raw.columns[-1]
 
-        # UI：ユーザーが最終決定
         col1, col2 = st.columns(2)
-
         with col1:
             subject_col = st.selectbox(
                 "科目列（勘定科目）が入っている列を選んでください",
@@ -172,51 +118,25 @@ if uploaded_file is not None:
             )
             st.caption(f"推定候補TOP3: {[c[0] for c in amount_candidates[:3]]}")
 
-        # 整形データを作る（科目＋金額）
+        # 正規化
         df_norm = pd.DataFrame({
-            "科目": df_raw[subject_col].astype(str).str.strip(),
+            "科目": df_raw[subject_col].where(df_raw[subject_col].notna(), ""),
             "金額": df_raw[amount_col].apply(to_number)
         })
-
-        # 科目が空の行や金額が全部NaNの行を落とす
-        # ===== 正規化（科目＋金額）=====
-        subject_series = df_raw[subject_col]
-        amount_series = df_raw[amount_col]
-
-        df_norm = pd.DataFrame({
-            "科目": subject_series.where(subject_series.notna(), ""),  # NaN→空文字
-            "金額": amount_series.apply(to_number)
-        })
-
-        # 前後の空白を削除
         df_norm["科目"] = df_norm["科目"].astype(str).str.strip()
-
-        # 科目が空 or 'nan' の行を除外（nan文字対策）
-        df_norm = df_norm[df_norm["科目"] != ""]
-        df_norm = df_norm[df_norm["科目"].str.lower() != "nan"]
-
-        # 金額がない行を除外
+        df_norm = df_norm[(df_norm["科目"] != "") & (df_norm["科目"].str.lower() != "nan")]
         df_norm = df_norm[df_norm["金額"].notna()]
-
-        # 金額列を「数値型」に確定（groupby集計で落ちないように）
         df_norm["金額"] = pd.to_numeric(df_norm["金額"], errors="coerce")
         df_norm = df_norm[df_norm["金額"].notna()]
 
         st.write("### 正規化プレビュー（科目＋金額）")
-        st.dataframe(df_norm.head(20))
+        st.dataframe(df_norm.head(20), use_container_width=True)
 
         # =========================
-        # ② 利益系（再計算）サマリー
+        # ② 利益サマリー
         # =========================
         st.write("### ② 利益サマリー（再計算）")
 
-        def sum_by_keywords(df: pd.DataFrame, keywords: list[str]) -> float:
-            """科目にキーワードが含まれる行の金額合計（なければ0）"""
-            mask = df["科目"].astype(str).apply(lambda x: any(k in x for k in keywords))
-            s = df.loc[mask, "金額"].sum()
-            return float(s) if pd.notna(s) else 0.0
-
-        # まずは“あなたのCSVで確認できた大分類”に合わせたキーワード
         sales = sum_by_keywords(df_norm, ["売上高"])
         cogs = sum_by_keywords(df_norm, ["売上原価"])
         sga = sum_by_keywords(df_norm, [
@@ -224,27 +144,15 @@ if uploaded_file is not None:
             "販管費計", "販管費 計",
             "販売費及び一般管理費計", "販売費及び一般管理費 計"
         ])
-
         nonop_income = sum_by_keywords(df_norm, ["営業外収益"])
         nonop_exp = sum_by_keywords(df_norm, ["営業外費用"])
-
         special_gain = sum_by_keywords(df_norm, ["特別利益", "特別収益"])
         special_loss = sum_by_keywords(df_norm, ["特別損失"])
-
-        taxes = sum_by_keywords(df_norm, ["法人税等"])
-        tax_adj = sum_by_keywords(df_norm, ["法人税等調整額"])
 
         gross_profit = sales - cogs
         operating_profit = gross_profit - sga
         ordinary_profit = operating_profit + nonop_income - nonop_exp
         pretax_profit = ordinary_profit + special_gain - special_loss
-
-        # 税引後（参考）：税金系を差し引く
-        net_profit = pretax_profit - taxes - tax_adj
-
-        # 表示（円で見やすく）
-        def yen(x: float) -> str:
-            return f"{int(round(x)):,.0f}"
 
         colA, colB = st.columns(2)
         with colA:
@@ -254,87 +162,65 @@ if uploaded_file is not None:
             st.metric("販管費", yen(sga))
         with colB:
             st.metric("営業利益", yen(operating_profit))
-            st.metric("営業外収益", yen(nonop_income))
-            st.metric("営業外費用", yen(nonop_exp))
             st.metric("経常利益", yen(ordinary_profit))
-            st.metric("税引前利益", yen(pretax_profit))
-            st.metric("税引後利益（参考）", yen(net_profit))
+            st.metric("税引前利益（概算）", yen(pretax_profit))
 
         # =========================
-        # ③ 半自動：勘定科目カテゴリ分類
+        # ③ 納税予測（欠損金・中間納税を反映）
         # =========================
-        st.write("### ③ 勘定科目のカテゴリ分類（半自動）")
+        st.write("### ③ 納税予測（欠損金・中間納税を反映 / 概算）")
 
-        rules = load_rules()
-
-        # 科目一覧（重複除去）
-        subjects = sorted(df_norm["科目"].astype(str).unique())
-
-        # 既存ルールでカテゴリ付与
-        def assign_category(subj: str) -> str:
-            return rules.get(subj, "未分類")
-
-        df_cat = df_norm.copy()
-        df_cat["カテゴリ"] = df_cat["科目"].astype(str).apply(assign_category)
-
-        # 未分類だけをまず見せる
-        unclassified_subjects = sorted(
-            df_cat[df_cat["カテゴリ"] == "未分類"]["科目"].astype(str).unique().tolist()
+        effective_tax_rate = st.number_input(
+            "想定実効税率（%）",
+            min_value=0.0,
+            max_value=70.0,
+            value=30.0,
+            step=0.5
         )
-        st.write(f"未分類の科目数: {len(unclassified_subjects)}")
 
-        MAX_ROWS = 50
-        target_subjects = unclassified_subjects[:MAX_ROWS]
+        # 初期値（1回だけ）
+        if "loss_carryforward" not in st.session_state:
+            st.session_state["loss_carryforward"] = 0
+        if "interim_tax_paid" not in st.session_state:
+            st.session_state["interim_tax_paid"] = 0
 
-        if len(target_subjects) == 0:
-            st.success("未分類の科目はありません。")
+        loss_carryforward = st.number_input(
+            "欠損金（繰越控除）※手動入力（円）",
+            min_value=0,
+            step=100000,
+            key="loss_carryforward"
+        )
+
+        interim_tax_paid = st.number_input(
+            "中間納税（すでに支払った額）※手動入力（円）",
+            min_value=0,
+            step=100000,
+            key="interim_tax_paid"
+        )
+
+        st.caption(f"入力値：欠損金 {loss_carryforward:,} 円 / 中間納税 {interim_tax_paid:,} 円")
+
+
+        taxable_income = max(0.0, pretax_profit - float(loss_carryforward))
+        estimated_tax = taxable_income * (effective_tax_rate / 100.0)
+
+        estimated_additional_payment = max(0.0, estimated_tax - float(interim_tax_paid))
+        estimated_refund = max(0.0, float(interim_tax_paid) - estimated_tax)
+
+        st.write("#### 計算結果（概算）")
+        colT1, colT2, colT3 = st.columns(3)
+        with colT1:
+            st.metric("課税所得（概算）", yen(taxable_income))
+        with colT2:
+            st.metric("法人税等（概算）", yen(estimated_tax))
+        with colT3:
+            st.metric("追加で払う見込み", yen(estimated_additional_payment))
+
+        if estimated_refund > 0:
+            st.info(f"中間納税が概算税額を上回っています。還付見込み（概算）：{yen(estimated_refund)} 円")
         else:
-            st.info("未分類科目にカテゴリを割り当ててください（最大50件まで表示）。保存すると次回から自動分類されます。")
-
-            updates = {}
-            for subj in target_subjects:
-                current = rules.get(subj, "未分類")
-                updates[subj] = st.selectbox(
-                    f"科目: {subj}",
-                    options=DEFAULT_CATEGORIES,
-                    index=DEFAULT_CATEGORIES.index(current) if current in DEFAULT_CATEGORIES else DEFAULT_CATEGORIES.index("未分類")
-                )
-
-            col_save, col_reload = st.columns(2)
-
-            with col_save:
-                if st.button("分類ルールを保存"):
-                    for k, v in updates.items():
-                        if v != "未分類":
-                            rules[k] = v
-                    save_rules(rules)
-                    st.success("保存しました。次回から自動分類されます。")
-
-            with col_reload:
-                if st.button("ルールを読み直す"):
-                    st.rerun()
-
-        # カテゴリ別集計
-        st.write("### カテゴリ別集計")
-        df_cat["カテゴリ"] = df_cat["科目"].astype(str).apply(lambda s: rules.get(s, "未分類"))
-
-        # 念のため df_cat 側でも数値化した列で集計
-        df_cat["金額_num"] = pd.to_numeric(df_cat["金額"], errors="coerce")
-
-        summary = (
-            df_cat.groupby("カテゴリ", dropna=False)["金額_num"]
-            .sum(min_count=1)
-            .sort_values(ascending=False)
-            .reset_index()
-            .rename(columns={"金額_num": "金額"})
-        )
-
-        summary["金額"] = summary["金額"].round(0).astype("Int64")
-
-        st.dataframe(summary, use_container_width=True)
-
-        st.info("次はこの正規化データを使って『小計・合計の除外』や『売上/費用/利益の簡易集計』に進めます。")
+            st.caption("※あくまで概算です（地方税・事業税の内訳、税効果、調整項目などは未反映）。")
 
     except Exception as e:
-        st.error("CSVの読み込みまたは意味づけ処理でエラーが発生しました。")
-        st.error(e)
+        st.error("CSVの読み込みまたは処理でエラーが発生しました。")
+        st.exception(e)
